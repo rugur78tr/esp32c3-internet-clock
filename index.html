@@ -1,1 +1,229 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32-C3 Internet Clock</title>
+
+  <script type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module">
+  </script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #101827;
+      color: #f4f7fb;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+    }
+
+    main {
+      width: min(420px, 88%);
+      padding: 28px;
+      background: #1d293b;
+      border-radius: 18px;
+      box-shadow: 0 12px 40px #0005;
+    }
+
+    h1 { margin-top: 0; font-size: 25px; }
+    p { color: #b9c5d5; line-height: 1.5; }
+
+    label {
+      display: block;
+      margin: 18px 0 7px;
+    }
+
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #46566d;
+      background: #111b2a;
+      color: white;
+      font-size: 16px;
+    }
+
+    button, esp-web-install-button {
+      margin-top: 18px;
+    }
+
+    button {
+      width: 100%;
+      padding: 13px;
+      border: 0;
+      border-radius: 9px;
+      background: #4d8dff;
+      color: white;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: .5; cursor: wait; }
+
+    .status {
+      margin-top: 18px;
+      padding: 12px;
+      background: #111b2a;
+      border-radius: 8px;
+      font-size: 14px;
+      overflow-wrap: anywhere;
+    }
+
+    .note { font-size: 12px; }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>ESP32-C3 Internet Clock</h1>
+  <p>Install the firmware, then configure your Wi-Fi connection.</p>
+
+  <esp-web-install-button manifest="./manifest.json">
+    <button slot="activate">1. Install Firmware</button>
+    <span slot="unsupported">
+      Use Chrome or Microsoft Edge on a computer with USB.
+    </span>
+  </esp-web-install-button>
+
+  <hr style="border-color:#46566d;margin-top:25px">
+
+  <label for="ssid">Wi-Fi Name (SSID)</label>
+  <input id="ssid" autocomplete="off"
+         placeholder="Enter Wi-Fi name" maxlength="32">
+
+  <label for="password">Wi-Fi Password</label>
+  <input id="password" type="password"
+         autocomplete="new-password"
+         placeholder="Enter Wi-Fi password" maxlength="63">
+
+  <button id="configure">2. Configure Wi-Fi</button>
+
+  <div class="status" id="status" role="status">
+    Ready. Connect your ESP32-C3 using USB.
+  </div>
+
+  <p class="note">
+    Your Wi-Fi details are sent directly to the device over USB.
+    They are not uploaded to this website.
+  </p>
+</main>
+
+<script>
+const statusBox = document.getElementById("status");
+const configureButton = document.getElementById("configure");
+
+function status(message) {
+  statusBox.textContent = message;
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function readUntil(reader, token, timeoutMs = 10000) {
+  let buffer = "";
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+
+    const result = await Promise.race([
+      reader.read(),
+      wait(remaining).then(() => ({ timeout: true }))
+    ]);
+
+    if (result.timeout) break;
+    if (result.done) break;
+
+    buffer += new TextDecoder().decode(result.value);
+
+    if (buffer.includes(token)) return true;
+
+    // Prevent unbounded log accumulation.
+    if (buffer.length > 4096) buffer = buffer.slice(-1024);
+  }
+
+  throw new Error("Device did not respond: " + token);
+}
+
+configureButton.addEventListener("click", async () => {
+  const ssid = document.getElementById("ssid").value;
+  const password = document.getElementById("password").value;
+
+  if (!ssid.trim()) {
+    status("Please enter your Wi-Fi name.");
+    return;
+  }
+
+  if (ssid.includes("\n") || ssid.includes("\r") ||
+      password.includes("\n") || password.includes("\r")) {
+    status("Wi-Fi fields cannot contain line breaks.");
+    return;
+  }
+
+  if (!("serial" in navigator)) {
+    status("Web Serial is not supported. Use Chrome or Edge.");
+    return;
+  }
+
+  configureButton.disabled = true;
+  let port;
+  let reader;
+  let writer;
+
+  try {
+    status("Select your ESP32-C3 serial port...");
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+
+    status("Sending configuration request...");
+    await writer.write(new TextEncoder().encode("SET_WIFI\n"));
+
+    await readUntil(reader, "READY_FOR_SSID");
+    await writer.write(new TextEncoder().encode(ssid + "\n"));
+
+    await readUntil(reader, "READY_FOR_PASSWORD");
+    await writer.write(new TextEncoder().encode(password + "\n"));
+
+    status("Credentials sent. Connecting to Wi-Fi and synchronizing time...");
+
+    // The firmware may reboot or close the connection later.
+    // Keep reading until it confirms the NTP update or reports an error.
+    try {
+      await readUntil(reader, "SYNC_OK", 35000);
+      status("Time synchronized successfully! Your clock is ready.");
+    } catch (err) {
+      status("Configuration sent. Check the OLED and serial output for connection status.");
+    }
+
+  } catch (err) {
+    status("Error: " + err.message);
+  } finally {
+    if (reader) {
+      try { await reader.cancel(); } catch (_) {}
+      try { reader.releaseLock(); } catch (_) {}
+    }
+
+    if (writer) {
+      try { writer.releaseLock(); } catch (_) {}
+    }
+
+    if (port && port.readable && port.writable) {
+      try { await port.close(); } catch (_) {}
+    }
+
+    configureButton.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
